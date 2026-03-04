@@ -20,6 +20,9 @@ import DeviceInfo from "@/components/DeviceInfo";
 const REFRESH_MS = 10_000;
 const CHART_COLORS = ["#3b82f6", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6"];
 
+const LANES = ["REALTIME", "GOOD", "BAD"] as const;
+type Lane = (typeof LANES)[number];
+
 type ChartRow = Record<string, string | number> & { timestamp: string; sourceId: string };
 
 function buildChartData(points: ParsedDataPoint[]): ChartRow[] {
@@ -161,7 +164,11 @@ export default function DevicePage() {
   const router = useRouter();
   const deviceId = typeof params.id === "string" ? params.id : "";
   const [deviceIdInput, setDeviceIdInput] = useState(deviceId);
-  const [events, setEvents] = useState<DeviceEvent[] | null>(null);
+  const [eventsByLane, setEventsByLane] = useState<Record<Lane, DeviceEvent[] | null>>({
+    REALTIME: null,
+    GOOD: null,
+    BAD: null,
+  });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [visiblePids, setVisiblePids] = useState<Set<string>>(new Set());
@@ -175,18 +182,36 @@ export default function DevicePage() {
     if (!deviceId) return;
     setError(null);
     try {
-      const res = await fetch(
-        `/api/devices/events?deviceId=${encodeURIComponent(deviceId)}&limit=100`
+      const results = await Promise.all(
+        LANES.map(async (lane) => {
+          const res = await fetch(
+            `/api/devices/events?deviceId=${encodeURIComponent(deviceId)}&lane=${lane}`
+          );
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || `HTTP ${res.status}`);
+          }
+          const data = await res.json();
+          return { lane, events: (Array.isArray(data) ? data : []) as DeviceEvent[] };
+        })
       );
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `HTTP ${res.status}`);
+
+      const next: Record<Lane, DeviceEvent[]> = {
+        REALTIME: [],
+        GOOD: [],
+        BAD: [],
+      };
+      for (const r of results) {
+        next[r.lane as Lane] = r.events;
       }
-      const data = await res.json();
-      setEvents(Array.isArray(data) ? data : []);
+      setEventsByLane(next);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load events");
-      setEvents([]);
+      setEventsByLane({
+        REALTIME: [],
+        GOOD: [],
+        BAD: [],
+      });
     } finally {
       setLoading(false);
     }
@@ -202,12 +227,40 @@ export default function DevicePage() {
     return () => clearInterval(t);
   }, [deviceId, fetchEvents]);
 
-  const points = useMemo(() => (events ? parseEvents(events) : []), [events]);
-  const chartData = useMemo(() => buildChartData(points), [points]);
+  const pointsByLane = useMemo(() => {
+    const result: Record<Lane, ParsedDataPoint[]> = {
+      REALTIME: [],
+      GOOD: [],
+      BAD: [],
+    };
+    for (const lane of LANES) {
+      const evts = eventsByLane[lane];
+      result[lane] = evts ? parseEvents(evts) : [];
+    }
+    return result;
+  }, [eventsByLane]);
+
+  const chartDataByLane = useMemo(() => {
+    const result: Record<Lane, ChartRow[]> = {
+      REALTIME: [],
+      GOOD: [],
+      BAD: [],
+    };
+    for (const lane of LANES) {
+      result[lane] = buildChartData(pointsByLane[lane]);
+    }
+    return result;
+  }, [pointsByLane]);
+
+  const allPoints = useMemo(
+    () => LANES.flatMap((lane) => pointsByLane[lane]),
+    [pointsByLane]
+  );
+
   const uniquePids = useMemo(() => {
-    const set = new Set(points.map((p) => p.pid));
+    const set = new Set(allPoints.map((p) => p.pid));
     return Array.from(set).sort();
-  }, [points]);
+  }, [allPoints]);
 
   // Default: show only the first PID; new PIDs stay hidden until user toggles
   useEffect(() => {
@@ -215,10 +268,12 @@ export default function DevicePage() {
     setVisiblePids((prev) => {
       if (prev.size === 0) return new Set([uniquePids[0]]);
       const next = new Set<string>();
-      for (const p of prev) if (uniquePids.includes(p)) next.add(p);
+      prev.forEach((p) => {
+        if (uniquePids.includes(p)) next.add(p);
+      });
       return next.size ? next : new Set([uniquePids[0]]);
     });
-  }, [uniquePids.join(",")]);
+  }, [uniquePids]);
 
   const togglePid = useCallback((pid: string) => {
     setVisiblePids((prev) => {
@@ -237,17 +292,31 @@ export default function DevicePage() {
   };
 
   const sourcesSeen = useMemo(() => {
-    if (!events?.length) return [];
-    const set = new Set(events.map((e) => e.sourceId));
+    const allEvents = LANES.flatMap((lane) => eventsByLane[lane] ?? []);
+    if (!allEvents.length) return [];
+    const set = new Set(allEvents.map((e) => e.sourceId));
     return Array.from(set).sort();
-  }, [events]);
+  }, [eventsByLane]);
 
   const headerDate = useMemo(() => {
-    if (!chartData.length) return null;
-    const first = new Date(chartData[0].timestamp);
-    const last = new Date(chartData[chartData.length - 1].timestamp);
+    const all = LANES.flatMap((lane) => chartDataByLane[lane]);
+    if (!all.length) return null;
+    const sorted = [...all].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+    const first = new Date(sorted[0].timestamp);
+    const last = new Date(sorted[sorted.length - 1].timestamp);
     return { first, last };
-  }, [chartData]);
+  }, [chartDataByLane]);
+
+  const totalEvents = useMemo(
+    () =>
+      LANES.reduce(
+        (sum, lane) => sum + (eventsByLane[lane]?.length ?? 0),
+        0
+      ),
+    [eventsByLane]
+  );
 
   if (!deviceId) {
     return (
@@ -335,7 +404,8 @@ export default function DevicePage() {
         </div>
       </header>
 
-      {loading && events === null && (
+      {loading &&
+        Object.values(eventsByLane).every((v) => v === null) && (
         <div className="rounded-lg bg-[#0d1016] border border-[rgba(255,255,255,0.07)] p-12 text-center text-[#555]">
           Loading events…
         </div>
@@ -356,16 +426,18 @@ export default function DevicePage() {
         </div>
       )}
 
-      {!loading && events && events.length === 0 && !error && (
-        <div className="rounded-lg bg-[#0d1016] border border-[rgba(255,255,255,0.07)] p-12 text-center text-[#555]">
-          No events for this device.
-        </div>
-      )}
+      {!loading &&
+        LANES.every((lane) => (eventsByLane[lane]?.length ?? 0) === 0) &&
+        !error && (
+          <div className="rounded-lg bg-[#0d1016] border border-[rgba(255,255,255,0.07)] p-12 text-center text-[#555]">
+            No events for this device.
+          </div>
+        )}
 
-      {!loading && points.length > 0 && (
+      {!loading && allPoints.length > 0 && (
         <>
           <div className="flex flex-wrap items-center gap-x-6 gap-y-0.5 mb-2 text-sm text-[#555]">
-            <span>Events: {events?.length ?? 0}</span>
+            <span>Events: {totalEvents}</span>
             {sourcesSeen.length > 0 && (
               <span>Sources: {sourcesSeen.join(", ")}</span>
             )}
@@ -379,75 +451,104 @@ export default function DevicePage() {
           </div>
 
           <PidStatsCards
-            points={points}
+            points={allPoints}
             uniquePids={uniquePids}
             visiblePids={visiblePids}
             onTogglePid={togglePid}
           />
 
-          <div className="overflow-x-auto">
-            <div className="h-[500px] min-w-[400px] w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={chartData}
-                  margin={{ top: 8, right: 8, left: 0, bottom: 0 }}
-                >
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="rgba(255,255,255,0.05)"
-                    vertical={true}
-                    horizontal={true}
-                  />
-                  <XAxis
-                    dataKey="timestamp"
-                    stroke="#555"
-                    tick={{ fill: "#555", fontSize: 11 }}
-                    axisLine={{ stroke: "rgba(255,255,255,0.05)" }}
-                    tickLine={{ stroke: "rgba(255,255,255,0.05)" }}
-                    tickFormatter={(v) => new Date(v).toLocaleTimeString()}
-                  />
-                  <YAxis
-                    stroke="#555"
-                    tick={{ fill: "#555", fontSize: 11 }}
-                    axisLine={{ stroke: "rgba(255,255,255,0.05)" }}
-                    tickLine={{ stroke: "rgba(255,255,255,0.05)" }}
-                  />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Legend
-                    wrapperStyle={{ border: "none" }}
-                    iconType="circle"
-                    formatter={(value) => (
-                      <span className="text-gray-400 text-sm">{value}</span>
-                    )}
-                  />
-                  {uniquePids.map(
-                    (pid, i) =>
-                      visiblePids.has(pid) && (
-                        <Line
-                          key={pid}
-                          type="monotone"
-                          dataKey={pid}
-                          name={getPidLabel(pid)}
-                          stroke={CHART_COLORS[i % CHART_COLORS.length]}
-                          dot={<CustomDot />}
-                          connectNulls
-                        />
-                      )
-                  )}
-                  <Brush
-                    dataKey="timestamp"
-                    height={28}
-                    stroke="rgba(255,255,255,0.1)"
-                    fill="rgba(255,255,255,0.03)"
-                    tickFormatter={(v) => new Date(v).toLocaleTimeString()}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-            <p className="text-[#555] text-xs mt-1">
-              ● GEOTAB (filled) &nbsp; ○ UPS (outlined)
-            </p>
-          </div>
+          {LANES.map((lane) => {
+            const lanePoints = pointsByLane[lane];
+            const laneChartData = chartDataByLane[lane];
+            const hasData = lanePoints.length > 0;
+            return (
+              <section key={lane} className="mt-3">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                    {lane} lane
+                  </span>
+                  <span className="text-[#555] text-xs">
+                    {lanePoints.length} points
+                  </span>
+                </div>
+                {hasData ? (
+                  <div className="overflow-x-auto">
+                    <div className="h-[400px] min-w-[400px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart
+                          data={laneChartData}
+                          margin={{ top: 8, right: 8, left: 0, bottom: 0 }}
+                        >
+                          <CartesianGrid
+                            strokeDasharray="3 3"
+                            stroke="rgba(255,255,255,0.05)"
+                            vertical={true}
+                            horizontal={true}
+                          />
+                          <XAxis
+                            dataKey="timestamp"
+                            stroke="#555"
+                            tick={{ fill: "#555", fontSize: 11 }}
+                            axisLine={{ stroke: "rgba(255,255,255,0.05)" }}
+                            tickLine={{ stroke: "rgba(255,255,255,0.05)" }}
+                            tickFormatter={(v) =>
+                              new Date(v).toLocaleTimeString()
+                            }
+                          />
+                          <YAxis
+                            stroke="#555"
+                            tick={{ fill: "#555", fontSize: 11 }}
+                            axisLine={{ stroke: "rgba(255,255,255,0.05)" }}
+                            tickLine={{ stroke: "rgba(255,255,255,0.05)" }}
+                          />
+                          <Tooltip content={<CustomTooltip />} />
+                          <Legend
+                            wrapperStyle={{ border: "none" }}
+                            iconType="circle"
+                            formatter={(value) => (
+                              <span className="text-gray-400 text-sm">
+                                {value}
+                              </span>
+                            )}
+                          />
+                          {uniquePids.map(
+                            (pid, i) =>
+                              visiblePids.has(pid) && (
+                                <Line
+                                  key={pid}
+                                  type="monotone"
+                                  dataKey={pid}
+                                  name={getPidLabel(pid)}
+                                  stroke={CHART_COLORS[i % CHART_COLORS.length]}
+                                  dot={<CustomDot />}
+                                  connectNulls
+                                />
+                              )
+                          )}
+                          <Brush
+                            dataKey="timestamp"
+                            height={24}
+                            stroke="rgba(255,255,255,0.1)"
+                            fill="rgba(255,255,255,0.03)"
+                            tickFormatter={(v) =>
+                              new Date(v).toLocaleTimeString()
+                            }
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <p className="text-[#555] text-xs mt-1">
+                      ● GEOTAB (filled) &nbsp; ○ UPS (outlined)
+                    </p>
+                  </div>
+                ) : (
+                  <div className="rounded-lg bg-[#0d1016] border border-[rgba(255,255,255,0.07)] p-4 text-center text-[#555] text-xs">
+                    No events for {lane} lane.
+                  </div>
+                )}
+              </section>
+            );
+          })}
 
           <div className="flex flex-wrap gap-2 mt-3">
             {uniquePids.map((pid, i) => {

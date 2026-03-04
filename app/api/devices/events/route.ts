@@ -2,10 +2,25 @@ import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8080";
 
+// Shape returned by the backend probing API
+type BackendProbingEvent = {
+  deviceId: number | string;
+  vehicleId?: string;
+  sourceId: "GEOTAB" | "UPS" | string;
+  pid: string[];
+  pidValue: number[];
+  qualityLane?: string;
+  transmissionDelayMs?: number;
+  wasInOrder?: boolean;
+  eventTimestamp: string;
+  ingestedAt?: string;
+  classifiedAt?: string;
+};
+
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const deviceId = searchParams.get("deviceId");
-  const limit = searchParams.get("limit") ?? "100";
+  const lane = searchParams.get("lane") ?? "GOOD";
 
   if (!deviceId?.trim()) {
     return NextResponse.json(
@@ -14,7 +29,9 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const url = `${BACKEND_URL}/api/v1/devices/events?deviceId=${encodeURIComponent(deviceId)}&limit=${encodeURIComponent(limit)}`;
+  const url = `${BACKEND_URL}/api/v1/probing/events?deviceId=${encodeURIComponent(
+    deviceId
+  )}&lane=${encodeURIComponent(lane)}`;
 
   try {
     const res = await fetch(url, {
@@ -30,10 +47,22 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const data = await res.json();
-    return NextResponse.json(Array.isArray(data) ? data : []);
+    const raw = await res.json();
+    const data = Array.isArray(raw) ? raw : [];
+
+    // Normalize backend events into the shape expected by the UI
+    const normalized = data.map((e: BackendProbingEvent) => ({
+      deviceId: String(e.deviceId),
+      timestamp: e.eventTimestamp,
+      sourceId: e.sourceId,
+      pid: Array.isArray(e.pid) ? e.pid : [],
+      pidValue: Array.isArray(e.pidValue) ? e.pidValue : [],
+    }));
+
+    return NextResponse.json(normalized);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to fetch events";
+    const message =
+      err instanceof Error ? err.message : "Failed to fetch probing events";
     return NextResponse.json(
       { error: message },
       { status: 502 }
